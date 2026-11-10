@@ -1,0 +1,161 @@
+# Zulip team chat stack for Portainer git-ops behind Traefik reverse proxy.
+# Based on zulip/docker-zulip compose.yaml (12.x); differences:
+# - No published ports (Traefik owns 80/443)
+# - Joins the external Traefik network and routes with labels
+# - Secrets and configuration sourced from stack environment variables
+services:
+  database:
+    image: ${POSTGRES_IMAGE:-zulip/zulip-postgresql:14}
+    restart: unless-stopped
+    secrets:
+      - zulip__postgres_password
+    environment:
+      POSTGRES_DB: zulip
+      POSTGRES_USER: zulip
+      POSTGRES_PASSWORD_FILE: /run/secrets/zulip__postgres_password
+    volumes:
+      - postgresql-14:/var/lib/postgresql/data
+
+  memcached:
+    image: ${MEMCACHED_IMAGE:-memcached:1.6-alpine}
+    restart: unless-stopped
+    command:
+      - sh
+      - -euc
+      - |
+        echo 'mech_list: plain' > "$$SASL_CONF_PATH"
+        echo "zulip@$$HOSTNAME:$$(cat $$MEMCACHED_PASSWORD_FILE)" > "$$MEMCACHED_SASL_PWDB"
+        echo "zulip@localhost:$$(cat $$MEMCACHED_PASSWORD_FILE)" >> "$$MEMCACHED_SASL_PWDB"
+        exec memcached -S
+    secrets:
+      - zulip__memcached_password
+    environment:
+      SASL_CONF_PATH: /home/memcache/memcached.conf
+      MEMCACHED_SASL_PWDB: /home/memcache/memcached-sasl-db
+      MEMCACHED_PASSWORD_FILE: /run/secrets/zulip__memcached_password
+
+  rabbitmq:
+    image: ${RABBITMQ_IMAGE:-rabbitmq:4.2}
+    restart: unless-stopped
+    command:
+      - sh
+      - -euc
+      - |
+        export RABBITMQ_DEFAULT_PASS="$$(cat $$RABBITMQ_PASSWORD_FILE)"
+        echo 'default_user = $$(RABBITMQ_DEFAULT_USER)' >> /etc/rabbitmq/rabbitmq.conf
+        echo 'default_pass = $$(RABBITMQ_DEFAULT_PASS)' >> /etc/rabbitmq/rabbitmq.conf
+        exec docker-entrypoint.sh rabbitmq-server
+    secrets:
+      - zulip__rabbitmq_password
+    environment:
+      RABBITMQ_DEFAULT_USER: zulip
+      RABBITMQ_PASSWORD_FILE: /run/secrets/zulip__rabbitmq_password
+    volumes:
+      - rabbitmq:/var/lib/rabbitmq
+
+  redis:
+    image: ${REDIS_IMAGE:-redis:8-alpine}
+    restart: unless-stopped
+    command:
+      - sh
+      - -euc
+      - '/usr/local/bin/docker-entrypoint.sh --requirepass "$$(cat $$REDIS_PASSWORD_FILE)"'
+    secrets:
+      - zulip__redis_password
+    environment:
+      REDIS_PASSWORD_FILE: /run/secrets/zulip__redis_password
+    volumes:
+      - redis:/data
+
+  zulip:
+    image: ${ZULIP_IMAGE:-ghcr.io/zulip/zulip-server:12.3-0}
+    container_name: ${ZULIP_CONTAINER_NAME:-zulip}
+    restart: unless-stopped
+    secrets:
+      - zulip__postgres_password
+      - zulip__memcached_password
+      - zulip__rabbitmq_password
+      - zulip__redis_password
+      - zulip__secret_key
+      - zulip__email_password
+      - zulip__social_auth_google_secret
+    environment:
+      SETTING_REMOTE_POSTGRES_HOST: database
+      SETTING_MEMCACHED_LOCATION: memcached:11211
+      SETTING_RABBITMQ_HOST: rabbitmq
+      SETTING_REDIS_HOST: redis
+      SETTING_EXTERNAL_HOST: ${ZULIP_HOST:?}
+      SETTING_ZULIP_ADMINISTRATOR: ${SETTING_ZULIP_ADMINISTRATOR:?}
+      # CERTIFICATES unset: nginx serves plain HTTP on :80, Traefik terminates TLS.
+      # Trust X-Forwarded-For from the Docker networks Traefik reaches us on.
+      LOADBALANCER_IPS: ${LOADBALANCER_IPS:-172.16.0.0/12}
+      # Outgoing email; the password is the zulip__email_password secret.
+      SETTING_EMAIL_HOST: ${SETTING_EMAIL_HOST:?}
+      SETTING_EMAIL_HOST_USER: ${SETTING_EMAIL_HOST_USER:?}
+      SETTING_EMAIL_PORT: ${SETTING_EMAIL_PORT:-587}
+      SETTING_EMAIL_USE_TLS: ${SETTING_EMAIL_USE_TLS:-True}
+      SETTING_NOREPLY_EMAIL_ADDRESS: ${SETTING_NOREPLY_EMAIL_ADDRESS:?}
+      # Default would be noreply-{token}@<ZULIP_HOST>; keep it on a domain the
+      # SMTP provider has verified as a sender.
+      SETTING_TOKENIZED_NOREPLY_EMAIL_ADDRESS: ${TOKENIZED_NOREPLY_EMAIL_ADDRESS:?}
+      # Login methods; Google needs SOCIAL_AUTH_GOOGLE_KEY (client id) and the
+      # zulip__social_auth_google_secret secret (client secret).
+      ZULIP_AUTH_BACKENDS: ${ZULIP_AUTH_BACKENDS:-EmailAuthBackend}
+      SETTING_SOCIAL_AUTH_GOOGLE_KEY: ${SOCIAL_AUTH_GOOGLE_KEY:-}
+      # Mobile push via Zulip's service; after enabling run manage.py register_server.
+      SETTING_ZULIP_SERVICE_PUSH_NOTIFICATIONS: ${SETTING_ZULIP_SERVICE_PUSH_NOTIFICATIONS:-False}
+      SETTING_ZULIP_SERVICE_SUBMIT_USAGE_STATISTICS: ${SETTING_ZULIP_SERVICE_SUBMIT_USAGE_STATISTICS:-False}
+      # Default is 200 API requests per minute per user; a script sharing a human's
+      # account starves that human's clients (429 on /events).
+      SETTING_RATE_LIMITING_RULES: ${SETTING_RATE_LIMITING_RULES:-'{"api_by_user": [(60, 1000)]}'}
+      # Shared host tuning: threaded queue workers instead of one process each.
+      CONFIG_application_server__queue_workers_multiprocess: ${QUEUE_WORKERS_MULTIPROCESS:-False}
+    volumes:
+      - zulip:/data
+    ulimits:
+      nofile:
+        soft: 1000000
+        hard: 1048576
+    networks:
+      - default
+      - traefik_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=${TRAEFIK_NETWORK_NAME:-proxy}"
+      - "traefik.http.routers.zulip.rule=Host(`${ZULIP_HOST:?}`)"
+      - "traefik.http.routers.zulip.entrypoints=websecure"
+      - "traefik.http.routers.zulip.tls.certresolver=${TRAEFIK_CERTRESOLVER:-le}"
+      - "traefik.http.services.zulip.loadbalancer.server.port=80"
+    depends_on:
+      - database
+      - memcached
+      - rabbitmq
+      - redis
+
+# Compose secrets sourced from the stack environment (Portainer env vars / .env).
+secrets:
+  zulip__postgres_password:
+    environment: ZULIP__POSTGRES_PASSWORD
+  zulip__memcached_password:
+    environment: ZULIP__MEMCACHED_PASSWORD
+  zulip__rabbitmq_password:
+    environment: ZULIP__RABBITMQ_PASSWORD
+  zulip__redis_password:
+    environment: ZULIP__REDIS_PASSWORD
+  zulip__secret_key:
+    environment: ZULIP__SECRET_KEY
+  zulip__email_password:
+    environment: ZULIP__EMAIL_PASSWORD
+  zulip__social_auth_google_secret:
+    environment: ZULIP__SOCIAL_AUTH_GOOGLE_SECRET
+
+networks:
+  traefik_network:
+    external: true
+    name: ${TRAEFIK_NETWORK_NAME:-proxy}
+
+volumes:
+  zulip:
+  postgresql-14:
+  rabbitmq:
+  redis:
